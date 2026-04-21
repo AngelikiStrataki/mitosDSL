@@ -83,7 +83,6 @@ pip install textX jinja2 fastapi uvicorn pyyaml
 ## 4. Installation
 
 ```bash
-unzip mitosDSL.zip
 cd mitosDSL
 python -m venv venv
 source venv/bin/activate
