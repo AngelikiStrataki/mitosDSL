@@ -1,0 +1,349 @@
+# --- Runtime helpers (shared by generated script + API functions) ---
+from collections import defaultdict
+import datetime
+
+def _safe_round(x, p=None):
+    try:
+        if x is None:
+            return None
+        return round(x, p) if p is not None else round(x)
+    except Exception:
+        return x
+
+def _num(v):
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        s = str(v).strip()
+        if s.count('.') == 1 and s.replace('.', '', 1).replace('-', '', 1).isdigit():
+            return float(s)
+        if s.replace('-', '', 1).isdigit():
+            return float(int(s))
+    except Exception:
+        pass
+    return None
+
+def _norm_key(v):
+    try:
+        if isinstance(v, str):
+            return v.strip()
+        return v
+    except Exception:
+        return v
+
+def _get_any(d, key):
+    if key in d and d.get(key) is not None:
+        return d.get(key)
+    if isinstance(key, str):
+        lk = key.lower()
+        for k in d.keys():
+            if isinstance(k, str) and k.lower() == lk and d.get(k) is not None:
+                return d.get(k)
+    return d.get(key) if key in d else None
+
+def _get_q(d, full, base=None):
+    v = _get_any(d, full) if full else None
+    if v is not None:
+        return v
+    if base:
+        v = _get_any(d, base)
+        if v is not None:
+            return v
+    return None
+
+def _parse_ts(v):
+    try:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            x = float(v)
+            if x > 10_000_000_000:
+                return x / 1000.0
+            return x
+        s = str(v).strip()
+        if not s:
+            return None
+        if s.replace('.', '', 1).replace('-', '', 1).isdigit():
+            x = float(s)
+            if x > 10_000_000_000:
+                return x / 1000.0
+            return x
+        try:
+            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                return dt.timestamp()
+            return dt.timestamp()
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+def _pick_ts_field(row):
+    for k in ("ts", "timestamp", "time", "datetime", "date"):
+        if k in row:
+            return k
+    for k in row.keys():
+        if isinstance(k, str) and k.lower() in ("ts", "timestamp", "time", "datetime", "date"):
+            return k
+    return None
+
+def _apply_window(rows, win_spec, kind, value, unit=None):
+    if not rows:
+        return rows
+
+    if kind == "samples":
+        try:
+            n = int(value)
+            if n <= 0:
+                return []
+            return rows[-n:] if len(rows) > n else rows
+        except Exception:
+            return rows
+
+    try:
+        mult = 1.0
+        if unit == "ms":
+            mult = 0.001
+        elif unit == "s":
+            mult = 1.0
+        elif unit == "m":
+            mult = 60.0
+        window_seconds = float(value) * mult
+
+        ts_key = _pick_ts_field(rows[0])
+        if not ts_key:
+            return rows
+
+        ts_vals = []
+        for r in rows:
+            t = _parse_ts(_get_any(r, ts_key))
+            if t is not None:
+                ts_vals.append(t)
+        if not ts_vals:
+            return rows
+
+        tmax = max(ts_vals)
+        tmin = tmax - window_seconds
+        out = []
+        for r in rows:
+            t = _parse_ts(_get_any(r, ts_key))
+            if t is None:
+                continue
+            if t >= tmin:
+                out.append(r)
+        return out if out else rows
+    except Exception:
+        return rows
+
+def _apply_alias_prefix(rows, alias):
+    if not rows or not alias:
+        return rows
+    out = []
+    for r in rows:
+        rr = dict(r)
+        for k, v in r.items():
+            kk = f"{alias}.{k}"
+            if kk not in rr:
+                rr[kk] = v
+        out.append(rr)
+    return out
+
+
+# ==============================================================================
+# MQTT helpers (continuous mode, NO time-based retention)
+# The ONLY time-based filtering is done later by WINDOW in your query logic.
+# ==============================================================================
+import threading
+import time
+import json
+import re
+from collections import deque
+
+try:
+    import paho.mqtt.client as mqtt
+except Exception:
+    mqtt = None
+
+_MQTT_STARTED = set()
+_MQTT_CLIENTS = {}   # source_name -> client
+_MQTT_BUFFERS = {}   # source_name -> deque[dict]
+_MQTT_LOCKS = {}     # source_name -> threading.Lock()
+
+
+def _parse_host_port(host_str, default_port=1883):
+    """
+    Accepts:
+      - "localhost:1883"
+      - "localhost"
+    Returns: (host, port_int)
+    """
+    try:
+        s = str(host_str).strip()
+        if ":" in s:
+            h, p = s.rsplit(":", 1)
+            return h.strip(), int(p.strip())
+        return s, int(default_port)
+    except Exception:
+        return str(host_str), int(default_port)
+
+
+# --------- MQTT payload parsing (FIX): JSON -> fallback key:value parsing ----------
+def _to_float_or_none(v):
+    try:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip()
+        if re.fullmatch(r"-?\d+(\.\d+)?", s):
+            return float(s)
+        return None
+    except Exception:
+        return None
+
+def _parse_kv_payload(payload_s):
+    """
+    Accepts:
+      - proper JSON: {"a":1,"b":2}
+      - relaxed kv:  a:1,b:2
+      - relaxed dict-ish: {a:1, b:2}
+    Returns dict.
+    """
+    if isinstance(payload_s, bytes):
+        payload_s = payload_s.decode("utf-8", errors="replace")
+    txt = str(payload_s).strip()
+
+    # 1) strict JSON
+    try:
+        obj = json.loads(txt)
+        if isinstance(obj, dict):
+            return obj
+        # if JSON but not dict, wrap
+        return {"value": obj}
+    except Exception:
+        pass
+
+    # 2) relaxed "{a:1,b:2}" -> "a:1,b:2"
+    if txt.startswith("{") and txt.endswith("}"):
+        txt = txt[1:-1].strip()
+
+    out = {}
+    if not txt:
+        return out
+
+    # 3) parse comma-separated key:value
+    for part in txt.split(","):
+        if ":" not in part:
+            continue
+        k, v = part.split(":", 1)
+        k = k.strip().strip('"').strip("'")
+        v = v.strip().strip('"').strip("'")
+        fv = _to_float_or_none(v)
+        out[k] = fv if fv is not None else v
+
+    # if nothing parsed, keep raw
+    return out if out else {"raw": str(payload_s)}
+# -------------------------------------------------------------------------------
+
+
+def _start_mqtt_continuous(source_name, host, port=None, topic=None, qos=0, client_id=None, max_messages=200000):
+    """
+    Starts a background MQTT consumer ONCE per source_name and keeps messages in memory.
+    NO time-based pruning is applied. A non-time-based cap (max_messages) protects RAM.
+
+    - If payload lacks a timestamp field, injects 'ts' as epoch seconds to enable WINDOW filtering.
+    """
+    if mqtt is None:
+        raise RuntimeError("paho-mqtt is not installed. Run: pip install paho-mqtt")
+
+    if source_name in _MQTT_STARTED:
+        return
+
+    if port is None:
+        # allow passing host like "localhost:1883"
+        host_only, port_val = _parse_host_port(host)
+    else:
+        host_only, port_val = str(host).strip(), int(port)
+
+    if not topic:
+        raise ValueError("MQTT topic is required")
+
+    # No time-based retention. Keep ALL messages, but cap by count (non-time).
+    # deque(maxlen=N) automatically drops oldest when full.
+    buf = deque(maxlen=int(max_messages) if max_messages is not None else None)
+    lock = threading.Lock()
+
+    _MQTT_BUFFERS[source_name] = buf
+    _MQTT_LOCKS[source_name] = lock
+
+    def on_connect(client, userdata, flags, rc):
+        try:
+            client.subscribe(topic, qos=qos)
+        except Exception as e:
+            print(f"[MQTT][{source_name}] subscribe error:", e)
+
+    def on_message(client, userdata, msg):
+        now = time.time()
+        try:
+            payload = msg.payload.decode("utf-8", errors="replace")
+
+            # FIX: tolerant parsing (JSON or relaxed kv)
+            row = _parse_kv_payload(payload)
+            if not isinstance(row, dict):
+                row = {"value": row}
+
+            # Keep useful debug fields
+            row.setdefault("topic", getattr(msg, "topic", None))
+            row.setdefault("raw", payload)
+
+            # Ensure there is a timestamp field for your WINDOW logic
+            if _pick_ts_field(row) is None:
+                row["ts"] = now
+
+            with lock:
+                buf.append(row)
+
+        except Exception as e:
+            # If something still goes wrong, do NOT spam parse errors for every message.
+            # Just store raw.
+            fallback = {"topic": getattr(msg, "topic", None), "raw": None, "ts": now}
+            try:
+                fallback["raw"] = msg.payload.decode("utf-8", errors="replace")
+            except Exception:
+                fallback["raw"] = str(msg.payload)
+            with lock:
+                buf.append(fallback)
+            print(f"[MQTT][{source_name}] parse error:", e)
+
+    try:
+        if client_id:
+            client = mqtt.Client(client_id=str(client_id))
+        else:
+            client = mqtt.Client()
+    except Exception:
+        client = mqtt.Client()
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    client.connect(host_only, int(port_val), keepalive=60)
+    client.loop_start()
+
+    _MQTT_CLIENTS[source_name] = client
+    _MQTT_STARTED.add(source_name)
+
+
+def mqtt_continuous_rows(source_name):
+    """
+    Returns a snapshot list[dict] of all currently buffered messages for this source.
+    """
+    buf = _MQTT_BUFFERS.get(source_name)
+    lock = _MQTT_LOCKS.get(source_name)
+    if not buf or not lock:
+        return []
+    with lock:
+        return list(buf)

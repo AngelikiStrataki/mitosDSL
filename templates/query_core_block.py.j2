@@ -1,0 +1,876 @@
+{# ===========================
+    query_core_block.py.j2
+    Core execution logic for ONE query.
+    Produces a Python variable named: results
+    IMPORTANT: always uses run_<OtherQuery>() for dependencies.
+    =========================== #}
+
+{# ---------- Macros ---------- #}
+{% macro src_prop(src, key, default='') -%}
+{%- set ns = namespace(found=None) -%}
+{%- if src and src.props and src.props.props -%}
+  {%- for p in src.props.props -%}
+    {%- if p.key == key -%}
+      {%- set ns.found = p.value -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{{ ns.found if ns.found is not none else default }}
+{%- endmacro %}
+
+{% macro mongo_field(name, src_type) -%}
+{{ '_id' if name == 'id' and src_type and src_type|lower == 'mongo' else name }}
+{%- endmacro %}
+
+{% macro join_qname(q) -%}
+{%- if q is string -%}
+{{ q }}
+{%- elif q.parts is defined and q.parts -%}
+{{ q.parts | join('.') }}
+{%- else -%}
+{{ q }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro last_id(q) -%}
+{%- if q is string -%}
+{{ q.split('.')[-1] }}
+{%- elif q.parts is defined and q.parts -%}
+{{ q.parts[-1] }}
+{%- else -%}
+{{ q }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro out_key_field(f) -%}
+{%- if f.alias is defined and f.alias -%}
+{{ f.alias }}
+{%- else -%}
+{{ last_id(f.name) }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro src_key_mongo_field(f, src_type) -%}
+{{ mongo_field(last_id(f.name), src_type) }}
+{%- endmacro %}
+
+{% macro sql_select_piece_field(f) -%}
+{{ join_qname(f.name) }}{% if f.alias is defined and f.alias %} AS {{ f.alias }}{% endif %}
+{%- endmacro %}
+
+{# ---------- Per-query computed Jinja vars ---------- #}
+{% set QNAME = (query.name if (query.name is defined and query.name) else 'anon_query') %}
+
+{% set FROM_T = (query.from.__class__.__name__ if (query.from is defined and query.from) else '') %}
+{% set FROM_IS_SOURCE   = (FROM_T == 'SourceTableRef') %}
+{% set FROM_IS_QUERYREF = (FROM_T == 'QueryRef') %}
+{% set FROM_IS_SUBQUERY = (FROM_T == 'QueryStmt') %}
+{% set FROM_ALIAS = (query.fromAlias if (query.fromAlias is defined and query.fromAlias) else '') %}
+
+{% if FROM_IS_SOURCE %}
+{% set SRC = query.from.source %}
+{% set SRC_TYPE = (SRC.type if SRC and SRC.type else '') %}
+{% set TABLE = query.from.table %}
+{% else %}
+{% set SRC = None %}
+{% set SRC_TYPE = '' %}
+{% set TABLE = None %}
+{% endif %}
+
+{% set SEL_IS_STAR = (query.sel.__class__.__name__ == 'Star') %}
+{% set SEL_IS_FIELDS = (query.sel.__class__.__name__ == 'Fields') %}
+{% set FIELDS = (query.sel.fields if (SEL_IS_FIELDS and query.sel.fields) else []) %}
+
+{# ---------------- SQL pushdown detection (SQL + GROUP BY + AGG + WINDOW *) ---------------- #}
+{% set SQL_PUSH = false %}
+
+{# pushdown only if: SQL source, has groupBy+aggs, all windows are AllRowsWindow, and NO joins to other queries #}
+{% if SRC_TYPE and SRC_TYPE|lower == "sql"
+      and query.groupBy and query.groupBy.fields
+      and query.aggregates and query.aggregates.aggs
+%}
+  {% set SQL_PUSH = true %}
+
+  {# all aggs must be WINDOW * #}
+  {% for a in query.aggregates.aggs %}
+    {% if a.window.__class__.__name__ != 'AllRowsWindow' %}
+      {% set SQL_PUSH = false %}
+    {% endif %}
+  {% endfor %}
+
+  {# if query has joins to QueryRef/QueryStmt, disable pushdown #}
+  {% if query.joins %}
+    {% for j in query.joins %}
+      {% if j.joinTarget.__class__.__name__ in ['QueryRef','QueryStmt'] %}
+        {% set SQL_PUSH = false %}
+      {% endif %}
+    {% endfor %}
+  {% endif %}
+{% endif %}
+{# ----------------------------------------------------------------------------------------- #}
+
+{# ---- Aliases used by WHERE/GB/ORDER compatibility ---- #}
+SEL_ALIAS = {
+{% if SEL_IS_FIELDS and (FIELDS|length>0) -%}
+{%- for f in FIELDS -%}
+{%- if f.alias is defined and f.alias -%}
+"{{ f.alias }}": ("{{ join_qname(f.name) }}", "{{ last_id(f.name) }}"),
+{%- endif -%}
+{%- endfor -%}
+{%- endif %}
+}
+
+{# base field -> alias map #}
+{% set BASE_ALIAS_DICT = {} %}
+{% if SEL_IS_FIELDS and (FIELDS|length>0) %}
+{% for f in FIELDS %}
+{% if f.alias is defined and f.alias %}
+{% set _ = BASE_ALIAS_DICT.update({ (last_id(f.name)) : f.alias }) %}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+BASE_ALIAS = {
+{% for _base, _alias in BASE_ALIAS_DICT.items() %}
+"{{ _base }}": "{{ _alias }}",
+{% endfor %}
+}
+
+{# ---------- FROM / SOURCE -> data ---------- #}
+{% if FROM_IS_QUERYREF %}
+{% set RQ = query.from.query.name %}
+data = run_{{ RQ }}()
+data = _apply_alias_prefix(data, "{{ FROM_ALIAS }}")
+
+{% elif FROM_IS_SUBQUERY %}
+{% set SQ = (query.from.name if (query.from.name is defined and query.from.name) else 'anon_query') %}
+data = run_{{ SQ }}()
+data = _apply_alias_prefix(data, "{{ FROM_ALIAS }}")
+
+{% elif SRC_TYPE and SRC_TYPE|lower == "sql" %}
+import mysql.connector
+
+_host_part = "{{ src_prop(SRC, 'host', '') }}"
+_user      = "{{ src_prop(SRC, 'username', '') }}"
+_pass      = "{{ src_prop(SRC, 'password', '') }}"
+_database  = "{{ src_prop(SRC, 'database', '') }}"
+_dataset   = "{{ src_prop(SRC, 'dataset', '') }}"
+
+_host, _port = _host_part.split(':') if ':' in _host_part else (_host_part, "3306")
+_db = _database if _database else (_dataset or None)
+
+conn = mysql.connector.connect(
+    host=_host,
+    port=int(_port),
+    database=_db,
+    user=_user,
+    password=_pass
+)
+cursor = conn.cursor()
+
+{% if SQL_PUSH %}
+{# ------------------------ SQL PUSH PATH: MySQL does WHERE/GROUP/AGG/ORDER/LIMIT ------------------------ #}
+
+{% set _gb_sql = [] %}
+{% for g in query.groupBy.fields %}
+  {% set _ = _gb_sql.append(join_qname(g)) %}
+{% endfor %}
+
+{% set _sel_sql = [] %}
+
+{% for g in query.groupBy.fields %}
+  {% set gexpr = join_qname(g) %}
+  {% set galias = BASE_ALIAS_DICT.get(last_id(g), last_id(g)) %}
+  {% set _ = _sel_sql.append(gexpr ~ " AS " ~ galias) %}
+{% endfor %}
+
+{# ===========================
+   CHANGE: apply PRECISION in SQL_PUSH via ROUND(...)
+   (everything else unchanged)
+   =========================== #}
+{% for a in query.aggregates.aggs %}
+  {% if a.wildcard is defined and a.wildcard %}
+    {% if a.func == 'count' %}
+      {% set _ = _sel_sql.append("COUNT(*) AS " ~ a.alias) %}
+    {% else %}
+      {% set _ = _sel_sql.append("NULL AS " ~ a.alias) %}
+    {% endif %}
+  {% else %}
+    {% set _expr = a.func|upper ~ "(" ~ join_qname(a.field) ~ ")" %}
+    {% if a.precision is defined and a.precision is not none and a.func in ['avg','sum','min','max'] %}
+      {% set _expr = "ROUND(" ~ _expr ~ ", " ~ a.precision ~ ")" %}
+    {% endif %}
+    {% set _ = _sel_sql.append(_expr ~ " AS " ~ a.alias) %}
+  {% endif %}
+{% endfor %}
+
+{% if FROM_ALIAS %}
+query_sql = "SELECT {{ _sel_sql | join(', ') }} FROM {{ TABLE }} AS {{ FROM_ALIAS }}"
+{% else %}
+query_sql = "SELECT {{ _sel_sql | join(', ') }} FROM {{ TABLE }}"
+{% endif %}
+
+{% macro sql_value(val) -%}
+{%- if val is string -%}
+  {%- set s = val -%}
+  {%- if s|lower in ['true','false'] -%}
+{{ 'TRUE' if s|lower == 'true' else 'FALSE' }}
+  {%- elif s.replace('.', '', 1).replace('-', '', 1).isdigit() -%}
+{{ s }}
+  {%- else -%}
+'{{ s.replace("'", "''") }}'
+  {%- endif -%}
+{%- else -%}
+{{ val }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro sql_operand(opnd) -%}
+{%- if opnd is not defined or opnd is none -%}
+NULL
+{%- elif opnd.parts is defined -%}
+{{ join_qname(opnd) }}
+{%- else -%}
+{{ sql_value(opnd) }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro sql_emit(node) -%}
+{%- set T = node.__class__.__name__ -%}
+{%- if T == 'OrExpr' -%}
+( {{ sql_emit(node.left) }}{% for ch in node.rights %} OR {{ sql_emit(ch.right) }}{% endfor %} )
+{%- elif T == 'AndExpr' -%}
+( {{ sql_emit(node.left) }}{% for ch in node.rights %} AND {{ sql_emit(ch.right) }}{% endfor %} )
+{%- elif T == 'NotExpr' -%}
+{%- set odd = (node.negs|length) % 2 -%}
+{%- if odd -%}
+( NOT ( {{ sql_emit(node.term) }} ) )
+{%- else -%}
+( {{ sql_emit(node.term) }} )
+{%- endif -%}
+{%- elif T == 'Predicate' -%}
+{%- if node.inner -%}
+( {{ sql_emit(node.inner) }} )
+{%- else -%}
+( {{ sql_emit(node.cmp) }} )
+{%- endif -%}
+{%- elif T == 'Comparison' -%}
+( {{ sql_operand(node.left) }} {{ node.op }} {{ sql_operand(node.right) }} )
+{%- else -%}
+( 1=1 )
+{%- endif -%}
+{%- endmacro %}
+
+{% if query.where and query.where.expr %}
+query_sql += " WHERE {{ sql_emit(query.where.expr) }}"
+{% endif %}
+
+query_sql += " GROUP BY {{ _gb_sql | join(', ') }}"
+
+{% if query.orderBy and query.orderBy.items %}
+{% set _ob_parts = [] %}
+{% for ob in query.orderBy.items %}
+  {% set dir = (ob.direction if (ob.direction is defined and ob.direction) else 'asc')|upper %}
+  {% set _ = _ob_parts.append(join_qname(ob.field) ~ " " ~ dir) %}
+{% endfor %}
+query_sql += " ORDER BY {{ _ob_parts | join(', ') }}"
+{% endif %}
+
+{% if query.limit and query.limit.value is defined %}
+query_sql += " LIMIT {{ query.limit.value }}"
+{% endif %}
+{% if query.offset and query.offset.value is defined %}
+query_sql += " OFFSET {{ query.offset.value }}"
+{% endif %}
+
+cursor.execute(query_sql)
+rows = cursor.fetchall()
+column_names = [desc[0] for desc in cursor.description]
+data = [dict(zip(column_names, row)) for row in rows]
+conn.close()
+
+
+{% else %}
+{# ------------------------ ORIGINAL SQL PATH (unchanged) ------------------------ #}
+
+{% if SEL_IS_STAR %}
+_select_sql = "*"
+{% elif SEL_IS_FIELDS and (FIELDS|length>0) %}
+{% set tf_list -%}
+{%- for f in FIELDS -%}
+{{ sql_select_piece_field(f) }}{%- if not loop.last %}, {% endif -%}
+{%- endfor -%}
+{%- endset %}
+_select_sql = "{{ tf_list | trim }}"
+{% else %}
+_select_sql = "*"
+{% endif %}
+
+{% if FROM_ALIAS %}
+query_sql = "SELECT " + _select_sql + " FROM {{ TABLE }} AS {{ FROM_ALIAS }}"
+{% else %}
+query_sql = "SELECT " + _select_sql + " FROM {{ TABLE }}"
+{% endif %}
+
+{% if query.joins %}
+{% for j in query.joins if (j.joinTarget.__class__.__name__ == 'SourceTableRef') %}
+{% set JALIAS = (j.joinAlias if (j.joinAlias is defined and j.joinAlias) else '') %}
+{% if JALIAS %}
+query_sql += " {{ (j.joinType or 'INNER') | upper }} JOIN {{ j.joinTarget.table }} AS {{ JALIAS }} ON {{ join_qname(j.condition.left) }} = {{ join_qname(j.condition.right) }}"
+{% else %}
+query_sql += " {{ (j.joinType or 'INNER') | upper }} JOIN {{ j.joinTarget.table }} ON {{ join_qname(j.condition.left) }} = {{ join_qname(j.condition.right) }}"
+{% endif %}
+{% endfor %}
+{% endif %}
+
+cursor.execute(query_sql)
+rows = cursor.fetchall()
+column_names = [desc[0] for desc in cursor.description]
+data = [dict(zip(column_names, row)) for row in rows]
+conn.close()
+
+{% if SEL_IS_FIELDS and (FIELDS|length>0) %}
+_norm = []
+for _r in data:
+    _row = dict(_r)
+    {% for f in FIELDS if f.alias is defined and f.alias %}
+    _alias = "{{ f.alias }}"
+    _bn = "{{ last_id(f.name) }}"
+    _qn = "{{ join_qname(f.name) }}"
+    _cands = (_qn, _qn.upper(), _qn.lower(), _bn, _bn.upper(), _bn.lower())
+    if _alias not in _row:
+        for _k in _cands:
+            if _k in _row:
+                _row[_alias] = _row.get(_k)
+                break
+    if _bn not in _row and _alias in _row:
+        _row[_bn] = _row.get(_alias)
+    {% endfor %}
+    _norm.append(_row)
+data = _norm
+{% endif %}
+
+data = _apply_alias_prefix(data, "{{ FROM_ALIAS }}")
+
+{% endif %}
+
+{% elif SRC_TYPE and SRC_TYPE|lower == "mongo" %}
+import pymongo
+
+_host_part = "{{ src_prop(SRC, 'host', '') }}"
+_user      = "{{ src_prop(SRC, 'username', '') }}"
+_pass      = "{{ src_prop(SRC, 'password', '') }}"
+_database  = "{{ src_prop(SRC, 'database', '') }}"
+_dataset   = "{{ src_prop(SRC, 'dataset', '') }}"
+
+client = pymongo.MongoClient(
+    {% if src_prop(SRC,'username','') and src_prop(SRC,'password','') %}
+    f"mongodb://{{ src_prop(SRC,'username','') }}:{{ src_prop(SRC,'password','') }}@{{ src_prop(SRC,'host','') }}"
+    {% else %}
+    f"mongodb://{{ src_prop(SRC,'host','') }}"
+    {% endif %}
+)
+
+db_name = _database if _database else _dataset
+db = client[db_name]
+collection = db["{{ TABLE }}"]
+
+{% if SEL_IS_STAR %}
+data = list(collection.find({}, {"_id": 0}))
+{% elif SEL_IS_FIELDS and (FIELDS|length>0) %}
+projection = {
+    {% for f in FIELDS -%}
+    "{{ src_key_mongo_field(f, SRC_TYPE) }}": 1{%- if not loop.last %}, {% endif -%}
+    {%- endfor %}
+}
+data = list(collection.find({}, projection))
+{% else %}
+data = list(collection.find({}, {"_id": 0}))
+{% endif %}
+
+{% if SEL_IS_FIELDS and (FIELDS|length>0) %}
+_norm = []
+for _r in data:
+    _row = dict(_r)
+    {% for f in FIELDS if f.alias is defined and f.alias %}
+    _alias = "{{ f.alias }}"
+    _bn = "{{ last_id(f.name) }}"
+    _qn = "{{ join_qname(f.name) }}"
+    _src = "{{ src_key_mongo_field(f, SRC_TYPE) }}"
+    _cands = (_src, _src.upper(), _src.lower(), _qn, _qn.upper(), _qn.lower(), _bn, _bn.upper(), _bn.lower())
+    if _alias not in _row:
+        for _k in _cands:
+            if _k in _row:
+                _row[_alias] = _row.get(_k)
+                break
+    if _bn not in _row and _alias in _row:
+        _row[_bn] = _row.get(_alias)
+    {% endfor %}
+    if '_id' in _row and 'id' not in _row:
+        _row['id'] = _row['_id']
+    _norm.append(_row)
+data = _norm
+{% endif %}
+
+data = _apply_alias_prefix(data, "{{ FROM_ALIAS }}")
+
+{# Client-side joins for Mongo to SourceTableRef #}
+{% if query.joins %}
+{% for j in query.joins if (j.joinTarget.__class__.__name__ == 'SourceTableRef') %}
+_join_type_{{ loop.index }} = "{{ (j.joinType or 'INNER') | lower }}"
+_join_alias_{{ loop.index }} = "{{ j.joinAlias if (j.joinAlias is defined and j.joinAlias) else '' }}"
+_left_key_{{ loop.index }}  = "{{ mongo_field(last_id(j.condition.left), SRC_TYPE) }}"
+_right_key_{{ loop.index }} = "{{ mongo_field(last_id(j.condition.right), SRC_TYPE) }}"
+_join_coll_{{ loop.index }} = db["{{ j.joinTarget.table }}"]
+_right_docs_{{ loop.index }} = list(_join_coll_{{ loop.index }}.find({}))
+_right_docs_{{ loop.index }} = _apply_alias_prefix(_right_docs_{{ loop.index }}, _join_alias_{{ loop.index }})
+
+from collections import defaultdict as _ddict_{{ loop.index }}
+_right_index_{{ loop.index }} = _ddict_{{ loop.index }}(list)
+for _d in _right_docs_{{ loop.index }}:
+    _right_index_{{ loop.index }}[_norm_key(_d.get(_right_key_{{ loop.index }}))].append(_d)
+
+_new_data_{{ loop.index }} = []
+if _join_type_{{ loop.index }} in ("inner", "left"):
+    for _l in data:
+        _lk = _norm_key(_l.get(_left_key_{{ loop.index }}))
+        _matches = _right_index_{{ loop.index }}.get(_lk, [])
+        if _matches:
+            for _r in _matches:
+                _m = dict(_l)
+                for _k, _v in _r.items():
+                    if _k not in _m:
+                        _m[_k] = _v
+                _new_data_{{ loop.index }}.append(_m)
+        elif _join_type_{{ loop.index }} == "left":
+            _new_data_{{ loop.index }}.append(dict(_l))
+elif _join_type_{{ loop.index }} == "right":
+    _left_index_{{ loop.index }} = _ddict_{{ loop.index }}(list)
+    for _l in data:
+        _left_index_{{ loop.index }}[_norm_key(_l.get(_left_key_{{ loop.index }}))].append(_l)
+    for _r in _right_docs_{{ loop.index }}:
+        _rk = _norm_key(_r.get(_right_key_{{ loop.index }}))
+        _lms = _left_index_{{ loop.index }}.get(_rk, [])
+        if _lms:
+            for _l in _lms:
+                _m = dict(_l)
+                for _k, _v in _r.items():
+                    if _k not in _m:
+                        _m[_k] = _v
+                _new_data_{{ loop.index }}.append(_m)
+        else:
+            _new_data_{{ loop.index }}.append(dict(_r))
+else:
+    _seen = set()
+    for _l in data:
+        _lk = _norm_key(_l.get(_left_key_{{ loop.index }}))
+        _matches = _right_index_{{ loop.index }}.get(_lk, [])
+        if _matches:
+            for _r in _matches:
+                _m = dict(_l)
+                for _k, _v in _r.items():
+                    if _k not in _m:
+                        _m[_k] = _v
+                _new_data_{{ loop.index }}.append(_m)
+                _seen.add(id(_r))
+        else:
+            _new_data_{{ loop.index }}.append(dict(_l))
+    for _r in _right_docs_{{ loop.index }}:
+        if id(_r) not in _seen:
+            _new_data_{{ loop.index }}.append(dict(_r))
+
+data = _new_data_{{ loop.index }}
+{% endfor %}
+{% endif %}
+
+try:
+    client.close()
+except Exception:
+    pass
+
+{% elif SRC_TYPE and SRC_TYPE|lower == "mqtt" %}
+
+_host_part   = "{{ src_prop(SRC, 'host', '') }}"
+_topic       = "{{ src_prop(SRC, 'topic', '') }}"
+_client_id   = "{{ src_prop(SRC, 'clientId', 'dsl-client-' ~ QNAME) }}"
+
+if not _topic:
+    data = []
+else:
+    _start_mqtt_continuous(
+        "{{ SRC.name }}",
+        host=_host_part,
+        topic=_topic,
+        client_id=_client_id,
+        # max_messages=200000
+    )
+    data = mqtt_continuous_rows("{{ SRC.name }}")
+    {# FIX (necessary): warm up snapshot so first API call doesn't return empty before messages arrive #}
+    if not data:
+        import time as _t
+        _t.sleep(0.25)
+        data = mqtt_continuous_rows("{{ SRC.name }}")
+
+data = _apply_alias_prefix(data, "{{ FROM_ALIAS }}")
+
+{% else %}
+raise Exception("Unsupported FROM/SOURCE type for query {{ QNAME }}")
+{% endif %}
+
+{# ---------- Joins to other queries (QueryStmt / QueryRef): always run_<RQ>() ---------- #}
+{% if query.joins %}
+{% for j in query.joins if (j.joinTarget.__class__.__name__ in ['QueryStmt','QueryRef']) %}
+from collections import defaultdict as _ddict
+
+_left_full  = "{{ join_qname(j.condition.left) }}"
+_right_full = "{{ join_qname(j.condition.right) }}"
+_left_base  = "{{ last_id(j.condition.left) }}"
+_right_base = "{{ last_id(j.condition.right) }}"
+_join_type = "{{ (j.joinType or 'inner')|lower }}"
+_join_alias = "{{ j.joinAlias if (j.joinAlias is defined and j.joinAlias) else '' }}"
+
+{% if j.joinTarget.__class__.__name__ == 'QueryStmt' %}
+{% set RQ = (j.joinTarget.name if (j.joinTarget.name is defined and j.joinTarget.name) else 'anon_query') %}
+{% else %}
+{% set RQ = j.joinTarget.query.name %}
+{% endif %}
+
+_right = run_{{ RQ }}()
+_right = _apply_alias_prefix(_right, _join_alias)
+
+def _jkey_norm(v):
+    try:
+        return v.strip().casefold() if isinstance(v, str) else v
+    except Exception:
+        return v
+
+_right_index = _ddict(list)
+for _r in _right:
+    _rk = _jkey_norm(_get_q(_r, _right_full, _right_base))
+    if _rk is not None:
+        _right_index[_rk].append(_r)
+
+_new_data = []
+if _join_type in ("inner", "left"):
+    for _l in data:
+        _lk = _jkey_norm(_get_q(_l, _left_full, _left_base))
+        _matches = _right_index.get(_lk, [])
+        if _matches:
+            for _r in _matches:
+                _m = dict(_l)
+                for _k, _v in _r.items():
+                    if _k not in _m:
+                        _m[_k] = _v
+                _new_data.append(_m)
+        elif _join_type == "left":
+            _new_data.append(dict(_l))
+elif _join_type == "right":
+    _left_index = _ddict(list)
+    for _l in data:
+        _left_index[_jkey_norm(_get_q(_l, _left_full, _left_base))].append(_l)
+    for _r in _right:
+        _rk = _jkey_norm(_get_q(_r, _right_full, _right_base))
+        _lms = _left_index.get(_rk, [])
+        if _lms:
+            for _l in _lms:
+                _m = dict(_l)
+                for _k, _v in _r.items():
+                    if _k not in _m:
+                        _m[_k] = _v
+                _new_data.append(_m)
+        else:
+            _new_data.append(dict(_r))
+else:
+    _seen = set()
+    for _l in data:
+        _lk = _jkey_norm(_get_q(_l, _left_full, _left_base))
+        _matches = _right_index.get(_lk, [])
+        if _matches:
+            for _r in _matches:
+                _m = dict(_l)
+                for _k, _v in _r.items():
+                    if _k not in _m:
+                        _m[_k] = _v
+                _new_data.append(_m)
+                _seen.add(id(_r))
+        else:
+            _new_data.append(dict(_l))
+    for _r in _right:
+        if id(_r) not in _seen:
+            _new_data.append(dict(_r))
+
+data = _new_data
+{% endfor %}
+{% endif %}
+
+{# ---------- WHERE / GROUP BY / AGG / ORDER / LIMIT / OFFSET ---------- #}
+{% if SQL_PUSH %}
+results = data
+{% else %}
+
+filtered = data
+
+def __to_num_if_numeric(v):
+    if isinstance(v, (int, float, bool)) or v is None:
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if s.lower() in ('true','false'):
+            return s.lower() == 'true'
+        if s.isdigit():
+            try: return int(s)
+            except: pass
+        try:
+            if s.count('.') == 1 and s.replace('.', '', 1).replace('-', '', 1).isdigit():
+                return float(s)
+        except: pass
+    return v
+
+def __cmp(op, lv, rv):
+    try:
+        if op == "==": return lv == rv
+        elif op == "!=": return lv != rv
+        elif op == ">":  return lv > rv
+        elif op == "<":  return lv < rv
+        elif op == ">=": return lv >= rv
+        elif op == "<=": return lv <= rv
+        else: return False
+    except: return False
+
+def __AND(vals):
+    for b in vals:
+        if not b: return False
+    return True
+
+def __OR(vals):
+    return any(bool(b) for b in vals)
+
+{% set _op_map = {'=':'==','!=':'!=','>':'>','<':'<','>=':'>=','<=':'<='} %}
+
+{% macro py_value(val) -%}
+{%- if val is string -%}
+{%- set s = val -%}
+{%- if s|lower in ['true','false'] -%}
+{{ 'True' if s|lower == 'true' else 'False' }}
+{%- elif s.replace('.', '', 1).replace('-', '', 1).isdigit() -%}
+{{ s }}
+{%- else -%}
+{{ '"' ~ s.replace('"','\\"') ~ '"' }}
+{%- endif -%}
+{%- else -%}
+{{ val }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro emit_operand(opnd) -%}
+{%- if opnd is not defined or opnd is none -%}
+None
+{%- elif opnd.parts is defined -%}
+_get_q(row, "{{ join_qname(opnd) }}", "{{ last_id(opnd) }}")
+{%- else -%}
+{{ py_value(opnd) }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro emit(node) -%}
+{%- set T = node.__class__.__name__ -%}
+{%- if T == 'OrExpr' -%}
+__OR([ {{ emit(node.left) }}{% for ch in node.rights %}, {{ emit(ch.right) }}{% endfor %} ])
+{%- elif T == 'AndExpr' -%}
+__AND([ {{ emit(node.left) }}{% for ch in node.rights %}, {{ emit(ch.right) }}{% endfor %} ])
+{%- elif T == 'NotExpr' -%}
+{%- set odd = (node.negs|length) % 2 -%}
+{%- if odd -%}
+(not ( {{ emit(node.term) }} ))
+{%- else -%}
+( {{ emit(node.term) }} )
+{%- endif -%}
+{%- elif T == 'Predicate' -%}
+{%- if node.inner -%}
+( {{ emit(node.inner) }} )
+{%- else -%}
+( {{ emit(node.cmp) }} )
+{%- endif -%}
+{%- elif T == 'Comparison' -%}
+__cmp("{{ _op_map.get(node.op, node.op) }}",
+      __to_num_if_numeric({{ emit_operand(node.left) }}),
+      __to_num_if_numeric({{ emit_operand(node.right) }}) )
+{%- else -%}
+True
+{%- endif -%}
+{%- endmacro %}
+
+{% if query.where and query.where.expr %}
+_tmp_filtered = []
+for row in data:
+    if {{ emit(query.where.expr) }}:
+        _tmp_filtered.append(row)
+filtered = _tmp_filtered
+{% else %}
+filtered = data
+{% endif %}
+
+GB_FULL = [
+{% if query.groupBy and query.groupBy.fields -%}
+{%- for g in query.groupBy.fields -%}
+"{{ join_qname(g) }}"{% if not loop.last %}, {% endif -%}
+{%- endfor -%}
+{%- endif %}
+]
+
+GB_BASE = [
+{% if query.groupBy and query.groupBy.fields -%}
+{%- for g in query.groupBy.fields -%}
+"{{ last_id(g) }}"{% if not loop.last %}, {% endif -%}
+{%- endfor -%}
+{%- endif %}
+]
+
+GB_OUT = [
+{% if query.groupBy and query.groupBy.fields -%}
+{%- for g in query.groupBy.fields -%}
+"{{ BASE_ALIAS_DICT.get(last_id(g), last_id(g)) }}"{% if not loop.last %}, {% endif %}
+{%- endfor -%}
+{%- endif %}
+]
+
+HAS_GROUPS = True if GB_FULL else False
+HAS_AGGS   = {{ 'True' if (query.aggregates and query.aggregates.aggs and (query.aggregates.aggs|length>0)) else 'False' }}
+
+def _compute_aggs_{{ QNAME }}(rows):
+    result_aggs = {}
+{% if query.aggregates and query.aggregates.aggs %}
+{% for a in query.aggregates.aggs %}
+    _rows_for_agg = rows
+    {% set W = a.window.__class__.__name__ %}
+    {% if W == 'AllRowsWindow' %}
+    _rows_for_agg = rows
+    {% elif W == 'SampleWindow' %}
+    _rows_for_agg = _apply_window(rows, None, "samples", {{ a.window.value }})
+    {% elif W == 'TimeWindow' %}
+    _rows_for_agg = _apply_window(rows, None, "time", {{ a.window.value }}, "{{ a.window.unit }}")
+    {% else %}
+    _rows_for_agg = rows
+    {% endif %}
+
+    _func = "{{ a.func }}"
+    {% if a.wildcard is defined and a.wildcard %}
+    if _func == 'count':
+        _val = len(_rows_for_agg)
+    else:
+        _val = None
+    {% else %}
+    _field_full = "{{ join_qname(a.field) }}"
+    _field_base = "{{ last_id(a.field) }}"
+    if _func == 'count':
+        _val = sum(1 for _r in _rows_for_agg if _get_q(_r, _field_full, _field_base) is not None)
+    else:
+        _vals = []
+        for _r in _rows_for_agg:
+            _nv = _num(_get_q(_r, _field_full, _field_base))
+            if _nv is not None:
+                _vals.append(_nv)
+
+        if _func == 'sum':
+            _val = sum(_vals) if _vals else 0
+        elif _func == 'avg':
+            _val = (sum(_vals) / len(_vals)) if _vals else None
+        elif _func == 'min':
+            _val = min(_vals) if _vals else None
+        elif _func == 'max':
+            _val = max(_vals) if _vals else None
+        else:
+            _val = None
+    {% endif %}
+
+    try:
+        if _val is not None and isinstance(_val, (int, float)):
+            {% if a.precision is defined and a.precision is not none %}
+            _val = _safe_round(_val, {{ a.precision }})
+            {% endif %}
+    except Exception:
+        pass
+
+    result_aggs["{{ a.alias }}"] = _val
+{% endfor %}
+{% endif %}
+    return result_aggs
+
+if not HAS_GROUPS and not HAS_AGGS:
+    results = []
+    for row in filtered:
+        out = {}
+        {% if SEL_IS_STAR %}
+        for k, v in row.items():
+            out[k] = v
+        {% elif SEL_IS_FIELDS and (FIELDS|length>0) %}
+        {% for f in FIELDS %}
+        out["{{ out_key_field(f) }}"] = _get_q(row, "{{ join_qname(f.name) }}", "{{ last_id(f.name) }}")
+        {% endfor %}
+        {% else %}
+        for k, v in row.items():
+            out[k] = v
+        {% endif %}
+        results.append(out)
+else:
+    groups = defaultdict(list)
+    if HAS_GROUPS:
+        for row in filtered:
+            key = tuple(_get_q(row, GB_FULL[i], GB_BASE[i]) for i in range(len(GB_FULL)))
+            groups[key].append(row)
+    else:
+        groups[None] = filtered
+
+    results = []
+    for key, rows in groups.items():
+        result = {}
+
+        if HAS_GROUPS:
+            if isinstance(key, tuple):
+                for i, g in enumerate(GB_OUT):
+                    val = key[i]
+                    result[g] = val
+                    for _base, _alias in BASE_ALIAS.items():
+                        if _alias == g and _base not in result:
+                            result[_base] = val
+
+        if HAS_AGGS:
+            result.update(_compute_aggs_{{ QNAME }}(rows))
+
+        results.append(result)
+
+{% if query.orderBy and query.orderBy.items %}
+{% for ob in query.orderBy.items | reverse %}
+def _sort_key(val):
+    if val is None:
+        return (2, "")
+    if isinstance(val, (int, float)):
+        return (0, val)
+    s = str(val).strip()
+    num_like = s.replace('-', '', 1).replace('.', '', 1)
+    if num_like.isdigit():
+        try:
+            return (0, float(s))
+        except Exception:
+            pass
+    return (1, s.casefold())
+
+results.sort(
+    key=lambda r: _sort_key(_get_q(r, "{{ join_qname(ob.field) }}", "{{ last_id(ob.field) }}")),
+    reverse={{ 'True' if (ob.direction is defined and ob.direction == 'desc') else 'False' }}
+)
+{% endfor %}
+{% endif %}
+
+{% set LIM = (query.limit.value if query.limit and query.limit.value is defined else None) %}
+{% set OFF = (query.offset.value if query.offset and query.offset.value is defined else None) %}
+
+{% if LIM is not none and OFF is not none %}
+results = results[ {{ OFF }} : {{ OFF + LIM }} ]
+{% elif LIM is not none %}
+results = results[: {{ LIM }} ]
+{% elif OFF is not none %}
+results = results[ {{ OFF }} : ]
+{% endif %}
+
+{% endif %}

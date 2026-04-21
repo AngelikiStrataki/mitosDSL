@@ -1,0 +1,56 @@
+# -*- coding: utf-8 -*-
+import math
+import datetime
+import textwrap
+from collections import defaultdict
+
+{% include "runtime_helpers.py.j2" %}
+
+# --- Query result cache (prevents re-running dependencies) ---
+_QUERY_CACHE = {}
+_QUERY_IN_PROGRESS = set()
+
+{% for query in queries %}
+{% set QNAME = (query.name if (query.name is defined and query.name) else 'anon_query') %}
+{% set FROM_T = (query.from.__class__.__name__ if (query.from is defined and query.from) else '') %}
+{% set IS_MQTT_QUERY = false %}
+{% if FROM_T == 'SourceTableRef' and query.from.source and query.from.source.type and query.from.source.type|lower == 'mqtt' %}
+{% set IS_MQTT_QUERY = true %}
+{% endif %}
+
+CORE_{{ QNAME }} = textwrap.dedent(r"""\
+{% include "query_core_block.py.j2" %}
+""").lstrip()
+
+def run_{{ QNAME }}(force: bool = False):
+    """
+    Auto-generated from DSL.
+    Returns: list[dict] or dict (JSON-serializable)
+    """
+    # MQTT queries are "live": do not serve from cache unless user explicitly wants it
+    if (not force) and (not {{ 'True' if IS_MQTT_QUERY else 'False' }}) and "{{ QNAME }}" in _QUERY_CACHE:
+        return _QUERY_CACHE["{{ QNAME }}"]
+
+    if "{{ QNAME }}" in _QUERY_IN_PROGRESS:
+        raise RuntimeError("Cyclic dependency detected while running: {{ QNAME }}")
+
+    _QUERY_IN_PROGRESS.add("{{ QNAME }}")
+    try:
+        # IMPORTANT: exec in ONE shared namespace so lambdas can see helpers defined in CORE (e.g. _sort_key)
+        _env = dict(globals())
+        _env["__name__"] = __name__
+        exec(CORE_{{ QNAME }}, _env, _env)
+
+        res = _env.get("results", [])
+        _QUERY_CACHE["{{ QNAME }}"] = res
+        return res
+    finally:
+        _QUERY_IN_PROGRESS.discard("{{ QNAME }}")
+
+{% endfor %}
+
+AVAILABLE_QUERIES = [
+{% for query in queries %}
+    "{{ query.name }}"{% if not loop.last %}, {% endif %}
+{% endfor %}
+]

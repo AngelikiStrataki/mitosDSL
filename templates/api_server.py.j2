@@ -1,0 +1,60 @@
+# -*- coding: utf-8 -*-
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
+
+import datetime
+import generated_queries as gq
+
+# Optional: Mongo ObjectId support (if bson is installed)
+try:
+    from bson import ObjectId
+except Exception:
+    ObjectId = None
+
+def _json_safe(obj):
+    if ObjectId is not None:
+        return jsonable_encoder(
+            obj,
+            custom_encoder={
+                ObjectId: str,
+                datetime.datetime: lambda d: d.isoformat(),
+                datetime.date: lambda d: d.isoformat(),
+            },
+        )
+    return jsonable_encoder(
+        obj,
+        custom_encoder={
+            datetime.datetime: lambda d: d.isoformat(),
+            datetime.date: lambda d: d.isoformat(),
+        },
+    )
+
+app = FastAPI(title="MitosDSL API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/queries")
+def list_queries():
+    return [{"name": name, "path": f"/query/{name}"} for name in gq.AVAILABLE_QUERIES]
+
+@app.get("/query/{name}")
+def run_query(name: str):
+    fn_name = f"run_{name}"
+    fn = getattr(gq, fn_name, None)
+    if fn is None:
+        raise HTTPException(status_code=404, detail=f"Unknown query: {name}")
+
+    result = fn()
+    return JSONResponse(content=_json_safe(result))
