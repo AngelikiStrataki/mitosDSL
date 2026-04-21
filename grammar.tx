@@ -1,0 +1,207 @@
+Model:
+    statements*=Statement
+;
+
+Statement:
+      SourceDecl
+    | QueryStmt
+;
+
+SourceDecl:
+    'SOURCE' '[' type=SourceType ']' name=ID
+    ('WITH' props=PropList)?
+    ';'
+;
+
+SourceType:
+    'SQL' | 'MONGO' | 'MQTT'
+;
+
+PropList:
+    props+=Prop[',']
+;
+
+Prop:
+    key=ID '=' value=Value
+;
+
+QueryStmt:
+    'SELECT' sel=SelectList
+    'FROM' from=FromRef ('AS' fromAlias=ID)?
+    joins*=JoinClause
+    where=WhereClause?
+    groupBy=GroupByClause?
+    aggregates=AggClause?
+    orderBy=OrderByClause?
+    limit=LimitClause?
+    offset=OffsetClause?
+    ('AS' name=ID)?
+    ';'
+;
+
+FromRef:
+      SourceTableRef
+    | QueryRef
+    | '(' QueryStmt ')'
+;
+
+QueryRef:
+    query=[QueryStmt]
+;
+
+SourceTableRef:
+    source=[SourceDecl] '.' table=ID
+;
+
+SelectList:
+      Star
+    | Fields
+;
+
+Star:
+    '*'
+;
+
+Fields:
+    fields+=Field[',']
+;
+
+Field:
+    name=QualifiedName ('AS' alias=ID)?
+;
+
+QualifiedName:
+    parts+=ID['.']
+;
+
+JoinClause:
+    joinType=JoinType?
+    'JOIN' joinTarget=JoinTarget ('AS' joinAlias=ID)?
+    'ON' condition=JoinCondition
+;
+
+JoinType:
+    'INNER' | 'LEFT' | 'RIGHT'
+;
+
+JoinTarget:
+      SourceTableRef
+    | QueryRef
+    | '(' QueryStmt ')'
+;
+
+
+JoinCondition:
+    left=QualifiedName '=' right=QualifiedName
+;
+
+WhereClause:
+    'WHERE' expr=BoolExpr
+;
+
+BoolExpr:
+    OrExpr
+;
+
+OrExpr:
+    left=AndExpr rights*=OrTail
+;
+
+OrTail:
+    'OR' right=AndExpr
+;
+
+AndExpr:
+    left=NotExpr rights*=AndTail
+;
+
+AndTail:
+    'AND' right=NotExpr
+;
+
+NotExpr:
+    negs*='NOT' term=Predicate
+;
+
+Predicate:
+      '(' inner=BoolExpr ')'
+    | cmp=Comparison
+;
+
+Comparison:
+    left=Operand op=CompOp right=Operand
+;
+
+Operand:
+      QualifiedName
+    | Value
+;
+
+CompOp:
+    '>=' | '<=' | '!=' | '>' | '<' | '='
+;
+
+Value:
+    INT | FLOAT | STRING | 'true' | 'false'
+;
+
+GroupByClause:
+    'GROUP' 'BY' fields+=QualifiedName[',']
+;
+
+AggClause:
+    'AGG' aggs+=AggItem[',']
+;
+
+AggItem:
+    func=AggFunc '(' (field=QualifiedName | wildcard='*') ')'
+    'WINDOW' window=WindowSpec
+    ('PRECISION' precision=INT)?
+    'AS' alias=ID
+;
+
+WindowSpec:
+    AllRowsWindow
+    |  TimeWindow
+    | SampleWindow
+;
+
+AllRowsWindow:
+    '*'
+;
+
+SampleWindow:
+    value=INT
+;
+
+TimeWindow:
+    value=INT unit=TimeUnit
+;
+
+AggFunc:
+    'count' | 'sum' | 'avg' | 'min' | 'max'
+;
+
+OrderByClause:
+    'ORDER' 'BY' items+=OrderItem[',']
+;
+
+OrderItem:
+    field=QualifiedName (direction=OrderDirection)?
+;
+
+OrderDirection:
+    'asc' | 'desc'
+;
+
+LimitClause:
+    'LIMIT' value=INT
+;
+
+OffsetClause:
+    'OFFSET' value=INT
+;
+
+TimeUnit:
+    'ms' | 's' | 'm'
+;

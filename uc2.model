@@ -1,0 +1,53 @@
+SOURCE [SQL] homeDB WITH
+  host="localhost:3306",
+  dataset="smarthome",
+  username="root",
+  password="Agg2704!"
+;
+
+SOURCE [MONGO] homeMeta WITH
+  host="localhost:27017",
+  database="smarthome"
+;
+
+SELECT
+  m.room AS room,
+  m.deviceId AS deviceId,
+  m.power AS power
+FROM homeDB.Metrics AS m
+WHERE (m.power > 0 AND m.sampleOk = true)
+GROUP BY m.room, m.deviceId
+AGG
+  avg(m.power) WINDOW * PRECISION 2 AS avgPower,
+  max(m.power) WINDOW *            AS peakPower,
+  count(*)     WINDOW *            AS numSamples
+ORDER BY avgPower desc
+LIMIT 5
+AS energyByDevice;
+
+SELECT
+  d.deviceId AS deviceId,
+  d.deviceType AS deviceType,
+  d.maxPower AS maxAllowedPower,
+  d.vendor AS vendor
+FROM homeMeta.Devices AS d
+LIMIT 6
+OFFSET 2
+AS deviceRegistry;
+
+SELECT
+  e.room AS room,
+  e.deviceId AS deviceId,
+  r.deviceType AS deviceType,
+  r.vendor AS vendor,
+  e.avgPower AS avgPower,
+  e.peakPower AS peakPower,
+  r.maxAllowedPower AS maxAllowedPower,
+  e.numSamples AS numSamples
+FROM energyByDevice AS e
+LEFT JOIN deviceRegistry AS r
+ON e.deviceId = r.deviceId
+ORDER BY avgPower desc
+LIMIT 3
+OFFSET 2
+AS smartHomeEnergyDashboard;

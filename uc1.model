@@ -1,0 +1,43 @@
+SOURCE [MQTT] mqttLocal WITH
+  host="localhost:1883",
+  clientId="dsl-client-1",
+  topic="sales/+/Sales"
+;
+
+SOURCE [SQL] salesDB WITH
+  host="localhost:3306",
+  dataset="sales",
+  username="root",
+  password="Agg2704!"
+;
+
+SELECT s.region AS region, s.revenue AS revenue
+FROM salesDB.Sales AS s
+WHERE (s.revenue > 400)
+GROUP BY s.region
+AGG sum(s.revenue) WINDOW * PRECISION 2 AS totalRevenue,
+    count(*)       WINDOW *            AS numSales
+ORDER BY totalRevenue desc
+LIMIT 10
+AS histByRegion;
+
+SELECT e.region AS region, e.revenue AS revenue
+FROM mqttLocal.Sales AS e
+WHERE (e.revenue > 400)
+GROUP BY e.region
+AGG sum(e.revenue) WINDOW 10s PRECISION 2 AS liveRevenue10s,
+    count(*)        WINDOW 10s            AS liveSales10s
+ORDER BY liveRevenue10s desc
+LIMIT 10
+AS liveByRegion;
+
+SELECT h.region AS region,
+       h.totalRevenue AS totalRevenue, h.numSales AS numSales,
+       l.liveRevenue10s AS liveRevenue10s, l.liveSales10s AS liveSales10s
+FROM histByRegion AS h
+LEFT JOIN liveByRegion AS l
+ON h.region = l.region
+ORDER BY liveRevenue10s desc
+LIMIT 20
+OFFSET 0
+AS salesOverview;

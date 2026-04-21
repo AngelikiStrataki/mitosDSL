@@ -1,0 +1,64 @@
+SOURCE [SQL] farmDB WITH
+  host="localhost:3306",
+  dataset="smartfarm",
+  username="root",
+  password="Agg2704!"
+;
+
+SOURCE [MONGO] farmMeta WITH
+  host="localhost:27017",
+  database="smartfarm"
+;
+
+SOURCE [MQTT] farmStream WITH
+  host="localhost:1883",
+  clientId="dsl-client-farm",
+  topic="farm/+/telemetry"
+;
+
+SELECT *
+FROM farmMeta.Plots AS p
+LIMIT 2
+AS plotRaw;
+
+SELECT
+  t.plotId AS plotId,
+  t.moisture AS moisture,
+  t.temp AS temp
+FROM farmStream.Telemetry AS t
+WHERE (t.moisture > 0 AND NOT (t.status = "maintenance"))
+   OR (t.sensorOk = true)
+GROUP BY t.plotId
+AGG
+  avg(t.moisture) WINDOW 10s PRECISION 2 AS liveMoisture10s,
+  avg(t.temp)     WINDOW 10s PRECISION 2 AS liveTemp10s
+ORDER BY liveMoisture10s asc
+LIMIT 20
+AS liveByPlot;
+
+SELECT
+  h.plotId AS plotId,
+  h.moisture AS moisture
+FROM farmDB.SoilHistory AS h
+WHERE (h.moisture >= 0)
+GROUP BY h.plotId
+AGG
+  avg(h.moisture) WINDOW * PRECISION 2 AS histMoistureAvg,
+  min(h.moisture) WINDOW * PRECISION 2 AS histMoistureMin,
+  max(h.moisture) WINDOW * PRECISION 2 AS histMoistureMax
+AS histByPlot;
+
+SELECT
+  h.plotId AS plotId,
+  h.histMoistureAvg AS histMoistureAvg,
+  h.histMoistureMin AS histMoistureMin,
+  h.histMoistureMax AS histMoistureMax
+FROM liveByPlot AS r
+RIGHT JOIN histByPlot AS h
+ON r.plotId = h.plotId
+LEFT JOIN farmMeta.Plots AS p
+ON h.plotId = p.plotId
+ORDER BY histMoistureAvg asc
+LIMIT 10
+OFFSET 2
+AS smartFarmRiskDashboard;
